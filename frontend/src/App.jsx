@@ -45,15 +45,10 @@ const ROLE_LABELS = {
   observer: "Observer",
 };
 
-const RECORD_TYPES = [
-  "Registration",
-  "Service",
-  "Repair",
-  "Accident",
-  "Insurance Claim",
-  "Seller Declaration",
-  "Ownership Transfer",
-];
+const RECORD_TYPES = {
+  service: ["Service", "Registration", "Repair", "Accident", "Insurance Claim"],
+  seller: ["Seller Declaration", "Ownership Transfer"],
+};
 
 const EMPTY_STATE = {
   chain: [],
@@ -368,26 +363,6 @@ function extractOdometerReading(ocrText, expectedOdometer) {
     return expectedDigits || exactMatch.normalized;
   }
 
-  if (expectedDigits) {
-    const closeMatch = normalizedCandidates
-      .map((candidate) => ({
-        ...candidate,
-        distance: digitDistance(candidate.normalized, expectedDigits),
-      }))
-      .filter((candidate) => candidate.distance <= Math.max(1, Math.floor(expectedLength * 0.18)))
-      .sort((first, second) => {
-        if (first.distance !== second.distance) {
-          return first.distance - second.distance;
-        }
-
-        return Math.abs(first.normalized.length - expectedLength) - Math.abs(second.normalized.length - expectedLength);
-      })[0];
-
-    if (closeMatch) {
-      return expectedDigits;
-    }
-  }
-
   return normalizedCandidates.sort((first, second) => {
     const firstDistance = Math.abs(first.normalized.length - expectedLength);
     const secondDistance = Math.abs(second.normalized.length - expectedLength);
@@ -398,33 +373,6 @@ function extractOdometerReading(ocrText, expectedOdometer) {
 
     return second.normalized.length - first.normalized.length;
   })[0].normalized;
-}
-
-function digitDistance(first, second) {
-  const rows = first.length + 1;
-  const columns = second.length + 1;
-  const distances = Array.from({ length: rows }, () => Array(columns).fill(0));
-
-  for (let row = 0; row < rows; row += 1) {
-    distances[row][0] = row;
-  }
-
-  for (let column = 0; column < columns; column += 1) {
-    distances[0][column] = column;
-  }
-
-  for (let row = 1; row < rows; row += 1) {
-    for (let column = 1; column < columns; column += 1) {
-      const substitutionCost = first[row - 1] === second[column - 1] ? 0 : 1;
-      distances[row][column] = Math.min(
-        distances[row - 1][column] + 1,
-        distances[row][column - 1] + 1,
-        distances[row - 1][column - 1] + substitutionCost,
-      );
-    }
-  }
-
-  return distances[first.length][second.length];
 }
 
 async function getOdometerOcrWorker() {
@@ -517,6 +465,8 @@ function App() {
   const [selectedVin, setSelectedVin] = useState("VIN1001");
   const [vehicleSearch, setVehicleSearch] = useState("VIN1001");
   const [buyerMessage, setBuyerMessage] = useState("");
+  const [buyerProof, setBuyerProof] = useState(null);
+  const [roleTokens, setRoleTokens] = useState({});
   const [serviceMessage, setServiceMessage] = useState("");
   const [tamperMessage, setTamperMessage] = useState("");
   const [lastTamper, setLastTamper] = useState(null);
@@ -636,6 +586,8 @@ function App() {
       ? primaryLanUrl || window.location.origin
       : `${primaryLanUrl || window.location.origin}?apiPort=${apiPort}`;
   const roleCounts = state.network?.roles || {};
+  const recordTypes = RECORD_TYPES[role] || [];
+  const recordType = recordTypes.includes(recordForm.type) ? recordForm.type : recordTypes[0];
 
   function handleSelectVehicle(vin) {
     const targetVin = normalizeVin(vin);
@@ -643,6 +595,8 @@ function App() {
 
     setSelectedVin(targetVin);
     setVehicleSearch(targetVin);
+    setBuyerMessage("");
+    setBuyerProof(null);
 
     if (vehicle) {
       setRecordForm((current) => ({
@@ -672,20 +626,38 @@ function App() {
     }
   }
 
-  function verifyVehicle() {
+  async function verifyVehicle() {
     const targetVin = normalizeVin(vehicleSearch);
-    const vehicle = vehicles.find((item) => item.vin === targetVin);
-
+    if (!targetVin) return;
     setSelectedVin(targetVin);
-
-    if (!vehicle) {
-      setBuyerMessage("No verified blockchain record exists for this VIN.");
-      return;
+    setBuyerProof(null);
+    setBuyerMessage("Checking record digests on Ethereum...");
+    try {
+      const response = await fetch(`${apiBase}/api/vehicles/${encodeURIComponent(targetVin)}/proof`);
+      const result = await safeJson(response);
+      if (!response.ok) throw new Error(result.error || "Could not read the anchor contract.");
+      setBuyerProof(result);
+      setBuyerMessage(result.valid
+        ? `${targetVin}: ${result.records.length} record hashes match the deployed contract.`
+        : `${targetVin}: integrity check failed. Review the vehicle's history before relying on it.`);
+    } catch (error) {
+      setBuyerMessage(error.message);
     }
+  }
 
-    setBuyerMessage(
-      `${vehicle.vin} verified. ${vehicle.records.length} immutable records found and chain status is ${state.valid ? "valid" : "invalid"}.`,
-    );
+  async function unlockRole(code) {
+    const response = await fetch(`${apiBase}/api/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role, code }),
+    });
+    const result = await safeJson(response);
+    if (!response.ok) throw new Error(result.error || "Unable to unlock this role.");
+    setRoleTokens((tokens) => ({ ...tokens, [role]: result.token }));
+  }
+
+  function clearExpiredRole(response) {
+    if (response.status === 401) setRoleTokens((tokens) => ({ ...tokens, [role]: undefined }));
   }
 
   async function addRecord() {
@@ -697,9 +669,10 @@ function App() {
     try {
       const response = await fetch(`${apiBase}/api/record`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${roleTokens[role]}` },
         body: JSON.stringify({
           ...recordForm,
+          type: recordType,
           vin: submittedVin,
           odometer: Number(recordForm.odometer),
           odometerPhotoReading:
@@ -714,6 +687,7 @@ function App() {
       const result = await safeJson(response);
 
       if (!response.ok) {
+        clearExpiredRole(response);
         throw new Error(result.error || "Unable to add record.");
       }
 
@@ -757,7 +731,7 @@ function App() {
     try {
       const response = await fetch(`${apiBase}/api/tamper`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${roleTokens[role]}` },
         body: JSON.stringify({
           ...tamperForm,
           vin: normalizeVin(tamperForm.vin),
@@ -768,6 +742,7 @@ function App() {
       const result = await safeJson(response);
 
       if (!response.ok && !result.reason) {
+        clearExpiredRole(response);
         throw new Error(result.error || "Tamper request failed.");
       }
 
@@ -792,7 +767,7 @@ function App() {
         <div className="brand-lockup">
           <img className="brand-art" src={heroImage} alt="Blockchain layers" />
           <div>
-            <p className="eyebrow">AutoTrust Ledger</p>
+            <p className="eyebrow">AutoTrust Ledger / Evidence Security</p>
             <h1>Vehicle Identity Blockchain</h1>
             <p className="brand-copy">
               Chassis history, odometer readings, service events, accident claims, and attack
@@ -805,7 +780,7 @@ function App() {
             {networkStatus === "online" ? "Node online" : "Node offline"}
           </span>
           <span className={`status-pill ${state.valid ? "valid" : "invalid"}`}>
-            {state.valid ? "Valid chain" : "Invalid chain"}
+            {state.valid && state.blockchain ? "Ethereum anchor ready" : "Anchor unavailable"}
           </span>
         </div>
       </header>
@@ -844,6 +819,7 @@ function App() {
           {role === "buyer" && (
             <BuyerPanel
               buyerMessage={buyerMessage}
+              buyerProof={buyerProof}
               isValid={state.valid}
               onSelectVehicle={handleSelectVehicle}
               onVerify={verifyVehicle}
@@ -854,21 +830,26 @@ function App() {
             />
           )}
 
-          {(role === "service" || role === "seller") && (
+          {role !== "buyer" && !roleTokens[role] && (
+            <RoleAccess key={role} role={activeRole.label} onUnlock={unlockRole} />
+          )}
+
+          {roleTokens[role] && (role === "service" || role === "seller") && (
             <ServicePanel
               actionLabel={role === "seller" ? "Add Seller Record" : "Add Immutable Record"}
               issuerLabel={role === "seller" ? "Seller name" : "Service company"}
               busyAction={busyAction}
               message={serviceMessage}
               onAddRecord={addRecord}
-              recordForm={recordForm}
+              recordForm={{ ...recordForm, type: recordType }}
+              recordTypes={recordTypes}
               selectedVehicle={selectedVehicle}
               setRecordForm={setRecordForm}
               vehicles={vehicles}
             />
           )}
 
-          {role === "attacker" && (
+          {role === "attacker" && roleTokens[role] && (
             <AttackerPanel
               busyAction={busyAction}
               lastTamper={lastTamper}
@@ -900,8 +881,40 @@ function App() {
   );
 }
 
+function RoleAccess({ role, onUnlock }) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      await onUnlock(code.trim());
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="role-content role-access" onSubmit={submit}>
+      <label>
+        {role} access code
+        <input type="password" autoComplete="off" value={code} onChange={(event) => setCode(event.target.value)} required />
+      </label>
+      <button className="primary-button" disabled={busy}>{busy ? "Checking access..." : "Unlock workspace"}</button>
+      {error && <div role="alert" className="callout alert">{error}</div>}
+      <p>Use the code issued by the local server operator. Buyer verification is open.</p>
+    </form>
+  );
+}
+
 function BuyerPanel({
   buyerMessage,
+  buyerProof,
   isValid,
   onSelectVehicle,
   onVerify,
@@ -942,9 +955,23 @@ function BuyerPanel({
           </div>
 
           {buyerMessage && (
-            <div className={`callout ${buyerMessage.startsWith("No") ? "alert" : "success"}`}>
+            <div role="status" className={`callout ${buyerProof?.valid ? "success" : ""}`}>
               {buyerMessage}
             </div>
+          )}
+
+          {buyerProof?.vin === selectedVehicle?.vin && buyerProof && (
+            <details className="anchor-receipts" open>
+              <summary>Ethereum transaction receipts</summary>
+              <div>Chain ID {buyerProof.chainId}</div>
+              <code>{buyerProof.contract}</code>
+              {buyerProof.records.map((proof) => (
+                <div key={proof.index}>
+                  <strong>Record {proof.index} · {proof.verified ? "Hash matched" : "Hash mismatch"}</strong>
+                  <code>{proof.transactionHash}</code>
+                </div>
+              ))}
+            </details>
           )}
 
           <div className="quick-vehicle-list" aria-label="Quick vehicle selection">
@@ -1148,6 +1175,7 @@ function ServicePanel({
   message,
   onAddRecord,
   recordForm,
+  recordTypes,
   selectedVehicle,
   setRecordForm,
   vehicles,
@@ -1284,7 +1312,7 @@ function ServicePanel({
             value={recordForm.type}
             onChange={(event) => setRecordForm((current) => ({ ...current, type: event.target.value }))}
           >
-            {RECORD_TYPES.map((type) => (
+            {recordTypes.map((type) => (
               <option key={type} value={type}>
                 {type}
               </option>
@@ -1627,7 +1655,8 @@ function AttackerPanel({
           <Metric label="Target stayed unchanged" value={`Block #${lastTamper.targetBlock.index}`} />
           <Metric label="Original hash" value={shortHash(lastTamper.targetBlock.hash)} />
           <Metric label="Alert block" value={`Block #${lastTamper.alertBlock?.index}`} />
-          <Metric label="Alert hash" value={shortHash(lastTamper.alertBlock?.hash)} />
+          <Metric label="Contract rejection" value={lastTamper.alertBlock?.data.contractRevert} />
+          <Metric label="Alert transaction" value={shortHash(lastTamper.alertBlock?.proof?.transactionHash)} />
         </div>
       )}
     </div>

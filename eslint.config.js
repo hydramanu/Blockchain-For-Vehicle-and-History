@@ -19,7 +19,7 @@ export default defineConfig([
     },
   },
   {
-    files: ['backend/**/*.js', 'scripts/**/*.js', 'frontend/vite.config.js'],
+    files: ['backend/**/*.js', 'scripts/**/*.js', 'frontend/vite.config.js', 'hardhat.config.cjs'],
     extends: [js.configs.recommended],
     languageOptions: {
       globals: globals.node,

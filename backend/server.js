@@ -3,11 +3,16 @@ import crypto from "crypto";
 import express from "express";
 import http from "http";
 import os from "os";
+import { join } from "node:path";
 import { Server } from "socket.io";
+import { connectAnchor, dataDir, readJson, saveJson } from "./chain.js";
+import { decodeOdometerPhoto, readOdometerPhoto } from "./odometer.js";
+import { createAccessControl, rateLimit } from "./security.js";
 
 const app = express();
+app.disable("x-powered-by");
 app.use(cors());
-app.use(express.json({ limit: "30mb" }));
+app.use(express.json({ limit: "12mb" }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -29,9 +34,38 @@ const ROLE_LABELS = {
 };
 
 const SECURITY_NODE = "AutoTrust Shield";
+const recordTypes = {
+  service: ["Registration", "Service", "Repair", "Accident", "Insurance Claim"],
+  seller: ["Seller Declaration", "Ownership Transfer"],
+};
+const access = await createAccessControl();
+const anchor = await connectAnchor();
+const storeFile = join(dataDir, "ledger.json");
 
 let notifications = [];
 const chain = [];
+let writeQueue = Promise.resolve();
+let pendingWrites = 0;
+let writeHealthy = true;
+
+const asyncRoute = (handler) => (req, res, next) => handler(req, res).catch(next);
+
+function serializedWrite(handler) {
+  return asyncRoute(async (req, res) => {
+    if (pendingWrites >= 4) return res.status(429).json({ error: "The evidence queue is full. Try again shortly." });
+    pendingWrites++;
+    const operation = writeQueue.then(() => {
+      if (!writeHealthy) return res.status(503).json({ error: "Anchor recovery required. Restart the API after restoring the chain." });
+      return handler(req, res);
+    });
+    writeQueue = operation.catch(() => {});
+    try {
+      await operation;
+    } finally {
+      pendingWrites--;
+    }
+  });
+}
 
 function stableStringify(value) {
   if (Array.isArray(value)) {
@@ -119,12 +153,6 @@ function getBlockPhotoUrls(block) {
   ]);
 }
 
-function normalizeOdometerReading(value) {
-  const reading = Number(value);
-
-  return Number.isFinite(reading) && reading >= 0 ? Math.round(reading) : null;
-}
-
 function createGenesisBlock() {
   const genesis = {
     index: 0,
@@ -151,7 +179,7 @@ function getLatestBlock() {
   return chain[chain.length - 1];
 }
 
-function appendBlock(data, author, timestamp = new Date().toISOString()) {
+function makeBlock(data, author, timestamp = new Date().toISOString()) {
   const block = {
     index: chain.length,
     timestamp,
@@ -162,6 +190,20 @@ function appendBlock(data, author, timestamp = new Date().toISOString()) {
   };
 
   block.hash = calculateHash(block);
+  return block;
+}
+
+async function appendAnchoredBlock(data, author) {
+  const block = makeBlock(data, author);
+  // Save the candidate before sending so a restart can recover a mined transaction.
+  await saveJson(storeFile, [...chain, block]);
+  try {
+    block.proof = await anchor.anchor(block);
+  } catch (error) {
+    writeHealthy = false;
+    console.error("Anchor write failed:", error.shortMessage || error.message);
+    return null;
+  }
   chain.push(deepFreeze(block));
   return block;
 }
@@ -338,7 +380,8 @@ function roleCounts() {
 function getState() {
   return {
     chain,
-    valid: isChainValid(),
+    valid: writeHealthy && isChainValid(),
+    blockchain: { address: anchor.address, chainId: anchor.chainId },
     vehicles: listVehicles(),
     securityEvents: getSecurityEvents(),
     notifications,
@@ -457,17 +500,17 @@ function seedLedger() {
     },
   ];
 
-  seedBlocks.forEach((block) => appendBlock(block.data, block.author, block.timestamp));
+  seedBlocks.forEach((block) => chain.push(makeBlock(block.data, block.author, block.timestamp)));
 }
 
-function validateRecordPayload(payload) {
+function validateRecordPayload(payload, role) {
   const vin = normalizeVin(payload.vin);
   const type = String(payload.type || "").trim();
   const description = String(payload.description || "").trim();
   const owner = String(payload.owner || "").trim();
   const company = String(payload.company || "").trim();
-  const author = String(payload.requestedBy || payload.company || "service-company").trim();
-  const odometer = Number(payload.odometer);
+  const author = ROLE_LABELS[role];
+  const odometer = payload.odometer;
   const photoUrls = normalizePhotoUrls([
     ...(Array.isArray(payload.photoUrls) ? payload.photoUrls : []),
     payload.photoUrl,
@@ -475,35 +518,16 @@ function validateRecordPayload(payload) {
     payload.vehicle?.photoUrl,
   ]);
   const photoUrl = photoUrls[0] || "";
-  const odometerPhotoUrl = normalizePhotoUrl(payload.odometerPhotoUrl);
-  const odometerPhotoReading = normalizeOdometerReading(payload.odometerPhotoReading);
-  const odometerOcrText = String(payload.odometerOcrText || "").trim();
-  const odometerOcrConfidence = Number(payload.odometerOcrConfidence);
-  const odometerVerified =
-    Boolean(odometerPhotoUrl) && odometerPhotoReading !== null && odometerPhotoReading === Math.round(odometer);
-
-  if (!vin || !type || !description || !owner || !company || !author) {
-    return { error: "VIN, type, odometer, description, owner, company, and author are required." };
+  const odometerPhotoUrl = payload.odometerPhotoUrl;
+  if (!/^[A-Z0-9-]{3,32}$/.test(vin) || !type || !description || !owner || !company ||
+      description.length > 2000 || owner.length > 160 || company.length > 160) {
+    return { error: "Enter a valid VIN, record type, description, owner, and company." };
   }
-
-  if (!Number.isFinite(odometer) || odometer < 0) {
-    return { error: "Odometer must be a valid non-negative number." };
+  if (!recordTypes[role].includes(type)) {
+    return { status: 403, error: "This role cannot submit that record type." };
   }
-
-  if (!odometerPhotoUrl) {
-    return { error: "Odometer proof photo is required." };
-  }
-
-  if (!odometerOcrText) {
-    return { error: "OCR must read the odometer photo before this record can be sealed." };
-  }
-
-  if (odometerPhotoUrl && odometerPhotoReading === null) {
-    return { error: "OCR could not read a number from the odometer proof photo." };
-  }
-
-  if (odometerPhotoUrl && !odometerVerified) {
-    return { error: "Odometer proof mismatch. The OCR reading from the photo must match the odometer value." };
+  if (!Number.isSafeInteger(odometer) || odometer < 0 || odometer > 9999999) {
+    return { error: "Odometer must be a whole number between 0 and 9,999,999 km." };
   }
 
   return {
@@ -515,10 +539,6 @@ function validateRecordPayload(payload) {
     author,
     odometer,
     odometerPhotoUrl,
-    odometerPhotoReading,
-    odometerOcrConfidence: Number.isFinite(odometerOcrConfidence) ? Math.round(odometerOcrConfidence) : null,
-    odometerOcrText,
-    odometerVerified,
     photoUrl,
     photoUrls,
     vehicle: {
@@ -534,8 +554,10 @@ function validateRecordPayload(payload) {
 }
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, valid: isChainValid(), blocks: chain.length });
+  res.status(writeHealthy ? 200 : 503).json({ ok: writeHealthy, valid: writeHealthy && isChainValid(), blocks: chain.length });
 });
+
+app.post("/api/session", rateLimit(8, 60_000), access.login);
 
 app.get("/api/state", (req, res) => {
   res.json(getState());
@@ -555,14 +577,36 @@ app.get("/api/vehicles/:vin", (req, res) => {
   return res.json({ vehicle, valid: isChainValid() });
 });
 
-app.post("/api/record", (req, res) => {
-  const payload = validateRecordPayload(req.body);
+app.get("/api/vehicles/:vin/proof", rateLimit(60, 60_000), asyncRoute(async (req, res) => {
+  const records = getVehicleBlocks(req.params.vin);
+  if (!records.length) return res.status(404).json({ error: "Vehicle not found in ledger." });
+  const matches = await Promise.all(records.map(async (block) => ({
+    index: block.index,
+    digest: "0x" + block.hash,
+    ...block.proof,
+    verified: await anchor.matches(block),
+  })));
+  res.json({
+    vin: normalizeVin(req.params.vin),
+    valid: isChainValid() && matches.every((proof) => proof.verified),
+    contract: anchor.address,
+    chainId: anchor.chainId,
+    records: matches,
+  });
+}));
+
+const writeLimit = rateLimit(20, 60_000);
+app.post("/api/record", writeLimit, access.requireRole("service", "seller"), serializedWrite(async (req, res) => {
+  const payload = validateRecordPayload(req.body || {}, req.accessRole);
 
   if (payload.error) {
-    return res.status(400).json({ error: payload.error });
+    return res.status(payload.status || 400).json({ error: payload.error });
   }
 
   const existingVehicle = summarizeVehicle(payload.vin);
+  if (Boolean(existingVehicle) === (payload.type === "Registration")) {
+    return res.status(409).json({ error: existingVehicle ? "This VIN is already registered." : "Register this VIN before adding history." });
+  }
 
   if (existingVehicle && payload.odometer < existingVehicle.currentOdometer) {
     emitNotification({
@@ -580,7 +624,17 @@ app.post("/api/record", (req, res) => {
     });
   }
 
-  const block = appendBlock(
+  const photo = decodeOdometerPhoto(payload.odometerPhotoUrl);
+  if (!photo) return res.status(400).json({ error: "Upload a JPEG or PNG odometer photo (max 2 MB and 2000 pixels per side)." });
+  if (chain.some((block) => block.data.odometerEvidenceHash === photo.hash && block.data.vin !== payload.vin)) {
+    return res.status(409).json({ error: "This odometer photo has already been used for another VIN." });
+  }
+  const ocr = await readOdometerPhoto(photo.bytes, payload.odometer);
+  if (!ocr.matched) {
+    return res.status(422).json({ error: "Server OCR could not confirm that reading. Upload a clear, cropped photo of the odometer." });
+  }
+
+  const block = await appendAnchoredBlock(
     {
       category: "vehicle",
       type: payload.type,
@@ -590,16 +644,18 @@ app.post("/api/record", (req, res) => {
       owner: payload.owner,
       company: payload.company,
       odometerPhotoUrl: payload.odometerPhotoUrl || undefined,
-      odometerPhotoReading: payload.odometerPhotoReading ?? undefined,
-      odometerOcrConfidence: payload.odometerOcrConfidence ?? undefined,
-      odometerOcrText: payload.odometerOcrText || undefined,
-      odometerVerified: payload.odometerVerified || undefined,
+      odometerPhotoReading: payload.odometer,
+      odometerOcrConfidence: ocr.confidence,
+      odometerOcrText: ocr.text,
+      odometerVerified: true,
+      odometerEvidenceHash: photo.hash,
       photoUrl: payload.photoUrl || undefined,
       photoUrls: payload.photoUrls.length ? payload.photoUrls : undefined,
       vehicle: payload.type === "Registration" ? payload.vehicle : undefined,
     },
     payload.author,
   );
+  if (!block) return res.status(503).json({ error: "Anchor confirmation failed. The record is pending recovery." });
 
   const vehicle = summarizeVehicle(payload.vin);
   emitNotification({
@@ -612,19 +668,21 @@ app.post("/api/record", (req, res) => {
   broadcastState();
 
   return res.json({ success: true, block, vehicle, valid: isChainValid() });
-});
+}));
 
-app.post("/api/tamper", (req, res) => {
-  const vin = normalizeVin(req.body.vin);
-  const fakeDescription = String(req.body.fakeDescription || "").trim();
-  const fakeOdometer = Number(req.body.fakeOdometer);
-  const sourceId = String(req.body.requestedBy || "external-write-source").trim();
-  const targetIndex = Number(req.body.targetIndex);
+app.post("/api/tamper", writeLimit, access.requireRole("attacker"), serializedWrite(async (req, res) => {
+  const body = req.body || {};
+  const vin = normalizeVin(body.vin);
+  const fakeDescription = String(body.fakeDescription || "").trim();
+  const fakeOdometer = Number(body.fakeOdometer);
+  const sourceId = String(body.requestedBy || "external-write-source").trim();
+  const targetIndex = Number(body.targetIndex);
+  const vehicleBlocks = getVehicleBlocks(vin);
   const targetBlock = Number.isInteger(targetIndex)
-    ? chain.find((block) => block.index === targetIndex && normalizeVin(block.data?.vin) === vin)
-    : getVehicleBlocks(vin).slice(-1)[0];
+    ? vehicleBlocks.find((block) => block.index === targetIndex)
+    : vehicleBlocks.at(-1);
 
-  if (!vin || !fakeDescription || !sourceId) {
+  if (!vin || !fakeDescription || fakeDescription.length > 2000 || !sourceId || sourceId.length > 160) {
     return res.status(400).json({ error: "VIN and attempted change details are required." });
   }
 
@@ -644,7 +702,15 @@ app.post("/api/tamper", (req, res) => {
     });
   }
 
-  const alertBlock = appendBlock(
+  const attemptedDigest = "0x" + calculateHash({
+    ...targetBlock,
+    data: { ...targetBlock.data, description: fakeDescription, odometer: fakeOdometer },
+  });
+  if (!await anchor.checkUnauthorizedRewrite(targetBlock, attemptedDigest) || !await anchor.matches(targetBlock)) {
+    return res.status(503).json({ error: "Could not verify that the contract blocked the rewrite." });
+  }
+
+  const alertBlock = await appendAnchoredBlock(
     {
       category: "security",
       type: "Tamper Attempt Blocked",
@@ -655,6 +721,8 @@ app.post("/api/tamper", (req, res) => {
       company: targetBlock.data.company,
       targetBlockIndex: targetBlock.index,
       originalHash: targetBlock.hash,
+      attemptedDigest,
+      contractRevert: "UnauthorizedWriter",
       attemptedChange: {
         fakeOdometer: Number.isFinite(fakeOdometer) ? fakeOdometer : null,
         fakeDescription,
@@ -665,6 +733,7 @@ app.post("/api/tamper", (req, res) => {
     },
     SECURITY_NODE,
   );
+  if (!alertBlock) return res.status(503).json({ error: "The security alert is pending anchor recovery." });
 
   const note = emitNotification({
     title: "Unauthorized write blocked",
@@ -679,11 +748,20 @@ app.post("/api/tamper", (req, res) => {
 
   return res.json({
     success: false,
-    reason: "Tamper attempt blocked. Original block was not changed; an alert block was added instead.",
+    reason: "The Solidity contract rejected the simulated write. The original digest still matches and the alert was anchored.",
     targetBlock,
     alertBlock,
     valid: isChainValid(),
   });
+}));
+
+app.use((error, _req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error.status === 400 || error.status === 413) {
+    return res.status(error.status).json({ error: error.status === 413 ? "Upload is too large." : "Invalid request body." });
+  }
+  console.error(error.shortMessage || error.message);
+  res.status(503).json({ error: "Verification service is temporarily unavailable." });
 });
 
 io.on("connection", (socket) => {
@@ -716,7 +794,19 @@ io.on("connection", (socket) => {
   });
 });
 
-seedLedger();
+const saved = await readJson(storeFile);
+if (saved) {
+  chain.push(...saved);
+} else {
+  seedLedger();
+  await saveJson(storeFile, chain);
+}
+if (!isChainValid() || await anchor.count() > chain.length) {
+  throw new Error("Local ledger does not match the on-chain history. Refusing to start.");
+}
+for (const block of chain) {
+  chain[block.index] = deepFreeze({ ...block, proof: await anchor.anchor(block) });
+}
 
 server.listen(PORT, HOST, () => {
   const lanUrls = getLanUrls();

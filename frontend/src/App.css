@@ -1367,3 +1367,30 @@ label {
     width: 34px;
   }
 }
+.role-access,
+.anchor-receipts {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.role-access {
+  max-width: 26rem;
+}
+
+.anchor-receipts {
+  padding: 0.85rem;
+  margin-block: 1rem;
+  border: 1px solid currentColor;
+  border-radius: 0.65rem;
+}
+
+.anchor-receipts summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.anchor-receipts code {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 0.75rem;
+}
